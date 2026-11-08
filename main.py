@@ -8,26 +8,31 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 # ==========================================
-# XAUUSD DAILY BIAS + 5 LEVELS BOT
-# SIGNAL ONLY — NO ORDERS
+# XAUUSD MARKET POSITIONING BOT
+# REPORT ONLY — NO SIGNALS — NO ORDERS
 # ==========================================
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+MYFXBOOK_EMAIL = os.getenv("MYFXBOOK_EMAIL")
+MYFXBOOK_PASSWORD = os.getenv("MYFXBOOK_PASSWORD")
+
+MYFXBOOK_API = "https://www.myfxbook.com/api"
 DATA_URL = "https://biquote.io/api/XAUUSD/ohlc"
 TELEGRAM_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 BAGHDAD = ZoneInfo("Asia/Baghdad")
 
 POLL_SECONDS = 15
-DAILY_HOUR = 7
+REPORT_HOUR = 8
 
-TP_DISTANCE = 10.0
-LEVEL_STEP = 10.0
-MAX_TP_WINS = 3
+# خەمڵاندنی Notional:
+# 1 standard lot = 100 oz ـی زێڕ
+# ئەمە پێویستە لەگەڵ contract size ـی سەرچاوەکە بگونجێت.
+GOLD_OZ_PER_LOT = 100
 
-STATE_FILE = os.getenv("STATE_FILE", "bot_state.json")
+STATE_FILE = os.getenv("STATE_FILE", "market_report_state.json")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,7 +41,7 @@ logging.basicConfig(
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "XAUUSD-Daily-Bias-Bot"
+    "User-Agent": "XAUUSD-Market-Report-Bot"
 })
 
 
@@ -50,9 +55,8 @@ def load_state():
             return json.load(f)
     except Exception:
         return {
-            "last_daily_date": None,
-            "telegram_offset": 0,
-            "plan": None
+            "last_report_date": None,
+            "telegram_offset": 0
         }
 
 
@@ -108,7 +112,7 @@ def send_message(message):
         return True
 
     except Exception:
-        logging.exception("Telegram message failed")
+        logging.exception("Telegram send failed")
         return False
 
 
@@ -141,7 +145,98 @@ def get_updates():
 
 
 # ==========================================
-# MARKET DATA
+# MYFXBOOK
+# ==========================================
+
+def myfxbook_request(method, params=None):
+
+    url = f"{MYFXBOOK_API}/{method}.json"
+
+    response = session.get(
+        url,
+        params=params or {},
+        timeout=30
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if data.get("error"):
+        raise RuntimeError(
+            data.get("message") or "Myfxbook API error"
+        )
+
+    return data
+
+
+def get_myfxbook_gold_data():
+
+    if not MYFXBOOK_EMAIL or not MYFXBOOK_PASSWORD:
+        raise RuntimeError(
+            "MYFXBOOK_EMAIL or MYFXBOOK_PASSWORD is missing."
+        )
+
+    # Login to Myfxbook
+
+    login_data = myfxbook_request(
+        "login",
+        {
+            "email": MYFXBOOK_EMAIL,
+            "password": MYFXBOOK_PASSWORD
+        }
+    )
+
+    api_session = login_data.get("session")
+
+    if not api_session:
+        raise RuntimeError("Myfxbook login failed: no session.")
+
+    try:
+
+        outlook = myfxbook_request(
+            "get-community-outlook",
+            {
+                "session": api_session
+            }
+        )
+
+        symbols = outlook.get("symbols", [])
+
+        gold = None
+
+        for item in symbols:
+
+            symbol_name = str(item.get("name", "")).upper()
+
+            if symbol_name == "XAUUSD":
+                gold = item
+                break
+
+        if not gold:
+            raise RuntimeError(
+                "XAUUSD was not found in Myfxbook community outlook."
+            )
+
+        return gold
+
+    finally:
+
+        # Revoke session after collecting the data.
+
+        try:
+            myfxbook_request(
+                "logout",
+                {
+                    "session": api_session
+                }
+            )
+        except Exception:
+            logging.warning("Myfxbook logout failed.")
+
+
+# ==========================================
+# MARKET CANDLES
 # ==========================================
 
 def find_bars(data):
@@ -201,7 +296,7 @@ def time_key(value):
         return (1, value)
 
 
-def fetch_closed_candles(interval, limit=100):
+def fetch_closed_candles(interval="1h", limit=100):
 
     response = session.get(
         DATA_URL,
@@ -209,7 +304,7 @@ def fetch_closed_candles(interval, limit=100):
             "interval": interval,
             "limit": limit
         },
-        timeout=20
+        timeout=25
     )
 
     response.raise_for_status()
@@ -228,7 +323,7 @@ def fetch_closed_candles(interval, limit=100):
             "is_open"
         )
 
-        # Only confirmed closed candles.
+        # تەنها کاندڵی داخراو و پشتڕاستکراو
 
         if is_open is not False:
             continue
@@ -280,493 +375,320 @@ def fetch_closed_candles(interval, limit=100):
         key=lambda x: time_key(x["time"])
     )
 
-    if not candles:
+    if len(candles) < 10:
         raise ValueError(
-            f"No closed candles found for {interval}"
+            f"Not enough closed {interval} candles."
         )
 
     return candles
 
 
-def fetch_daily_candles():
-
-    candles = fetch_closed_candles("1d", 100)
-
-    if len(candles) < 2:
-        raise ValueError("Need two closed daily candles.")
-
-    return candles
-
-
 # ==========================================
-# DAILY BIAS CALCULATION
+# LIQUIDITY ESTIMATION
 # ==========================================
 
-def analyze_daily():
+def find_liquidity_zones(candles):
 
-    candles = fetch_daily_candles()
+    current_price = candles[-1]["close"]
 
-    candle1 = candles[-2]
-    candle2 = candles[-1]
+    highs = []
+    lows = []
 
-    # DECISION
+    # Find local swing highs and lows.
 
-    if candle2["close"] > candle1["high"]:
+    for i in range(2, len(candles) - 2):
 
-        decision = "BUY"
+        previous = candles[i - 2:i]
+        following = candles[i + 1:i + 3]
 
-    elif candle2["close"] < candle1["low"]:
+        candle = candles[i]
 
-        decision = "SELL"
+        is_swing_high = all(
+            candle["high"] > item["high"]
+            for item in previous + following
+        )
 
-    else:
+        is_swing_low = all(
+            candle["low"] < item["low"]
+            for item in previous + following
+        )
 
-        decision = "NEUTRAL"
+        if is_swing_high:
+            highs.append(candle["high"])
 
-    # EXPANSION
+        if is_swing_low:
+            lows.append(candle["low"])
 
-    range1 = candle1["high"] - candle1["low"]
+    # Add recent extremes.
 
-    range2 = candle2["high"] - candle2["low"]
+    recent = candles[-24:]
 
-    if (
-        range2 > range1
-        and candle2["close"] > candle2["open"]
-    ):
+    highs.append(max(item["high"] for item in recent))
+    lows.append(min(item["low"] for item in recent))
 
-        expansion = "BULLISH"
+    # Group nearby levels.
 
-    elif (
-        range2 > range1
-        and candle2["close"] < candle2["open"]
-    ):
+    def group_levels(levels, tolerance=0.50):
 
-        expansion = "BEARISH"
+        groups = []
 
-    else:
+        for price in sorted(levels):
 
-        expansion = "NEUTRAL"
+            matched = False
 
-    # CONTRACTING
+            for group in groups:
 
-    contracting = (
-        candle2["high"] < candle1["high"]
-        and candle2["low"] > candle1["low"]
+                average = sum(group) / len(group)
+
+                if abs(price - average) <= tolerance:
+
+                    group.append(price)
+                    matched = True
+                    break
+
+            if not matched:
+                groups.append([price])
+
+        results = []
+
+        for group in groups:
+
+            average = sum(group) / len(group)
+
+            results.append({
+                "price": round(average, 2),
+                "touches": len(group)
+            })
+
+        return results
+
+    high_zones = group_levels(highs)
+    low_zones = group_levels(lows)
+
+    resistance_zones = [
+        item for item in high_zones
+        if item["price"] > current_price
+    ]
+
+    support_zones = [
+        item for item in low_zones
+        if item["price"] < current_price
+    ]
+
+    resistance_zones.sort(
+        key=lambda x: x["price"]
     )
 
-    # FINAL BIAS
-
-    if (
-        decision == "BUY"
-        and expansion == "BULLISH"
-    ):
-
-        bias = "BUY"
-
-    elif (
-        decision == "SELL"
-        and expansion == "BEARISH"
-    ):
-
-        bias = "SELL"
-
-    else:
-
-        bias = "NEUTRAL"
-
-    buy_votes = (
-        int(decision == "BUY")
-        + int(expansion == "BULLISH")
-    )
-
-    sell_votes = (
-        int(decision == "SELL")
-        + int(expansion == "BEARISH")
+    support_zones.sort(
+        key=lambda x: x["price"],
+        reverse=True
     )
 
     return {
-        "candle1": candle1,
-        "candle2": candle2,
-        "range1": range1,
-        "range2": range2,
-        "decision": decision,
-        "expansion": expansion,
-        "contracting": contracting,
-        "bias": bias,
-        "buy_votes": buy_votes,
-        "sell_votes": sell_votes
+        "current_price": current_price,
+        "resistance": resistance_zones[:3],
+        "support": support_zones[:3]
     }
 
 
 # ==========================================
-# DAILY PLAN CREATION
+# FORMAT HELPERS
 # ==========================================
 
-def create_daily_plan(result):
+def number(value, decimals=2):
 
-    bias = result["bias"]
+    try:
+        return f"{float(value):,.{decimals}f}"
+    except (TypeError, ValueError):
+        return "N/A"
 
-    if bias not in ("BUY", "SELL"):
+
+def integer(value):
+
+    try:
+        return f"{int(float(value)):,}"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def estimated_notional(lots, average_price):
+
+    try:
+
+        return (
+            float(lots)
+            * GOLD_OZ_PER_LOT
+            * float(average_price)
+        )
+
+    except (TypeError, ValueError):
         return None
 
-    # Latest CLOSED 5M candle.
 
-    candles = fetch_closed_candles("5m", 100)
+def format_zones(title, zones):
 
-    reference_candle = candles[-1]
+    lines = [title]
 
-    reference = reference_candle["close"]
+    if not zones:
+        lines.append("• هیچ ئاستێکی دیاریکراو نییە.")
+        return "\n".join(lines)
 
-    if bias == "BUY":
-        direction = 1
-        direction_text = "کڕین 🟢"
-        emoji = "🟢"
-    else:
-        direction = -1
-        direction_text = "فرۆشتن 🔴"
-        emoji = "🔴"
+    for item in zones:
 
-    # Main trade + four additional levels.
+        lines.append(
+            f"• {item['price']:.2f}"
+            f" — {item['touches']} جار"
+        )
 
-    entries = [
-        reference,
-        reference - 20.0,
-        reference - 10.0,
-        reference + 10.0,
-        reference + 20.0
-    ]
+    return "\n".join(lines)
 
-    trades = []
 
-    for index, entry in enumerate(entries):
+# ==========================================
+# REPORT
+# ==========================================
 
-        target = entry + (direction * TP_DISTANCE)
-
-        trades.append({
-            "number": index,
-            "entry": round(entry, 2),
-            "tp": round(target, 2),
-            "status": "WAITING",
-            "activated_time": None,
-            "tp_time": None
-        })
+def create_market_report():
 
     now = datetime.now(BAGHDAD)
 
-    plan = {
-        "date": now.strftime("%Y-%m-%d"),
-        "bias": bias,
-        "reference": round(reference, 2),
-        "direction": direction,
-        "direction_text": direction_text,
-        "emoji": emoji,
-        "trades": trades,
-        "tp_wins": 0,
-        "finished": False,
-        "last_5m_time": reference_candle["time"],
-        "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
-        "decision": result["decision"],
-        "expansion": result["expansion"]
-    }
+    # Myfxbook positioning
 
-    return plan
+    gold = get_myfxbook_gold_data()
 
+    long_positions = gold.get("longPositions")
+    short_positions = gold.get("shortPositions")
 
-# ==========================================
-# PLAN MESSAGE
-# ==========================================
+    long_volume = gold.get("longVolume")
+    short_volume = gold.get("shortVolume")
 
-def make_plan_message(plan):
+    long_percent = gold.get("longPercentage")
+    short_percent = gold.get("shortPercentage")
 
-    trades = plan["trades"]
+    avg_long = gold.get("avgLongPrice")
+    avg_short = gold.get("avgShortPrice")
 
-    main = trades[0]
-
-    extra = trades[1:]
-
-    message = (
-        "🦅🏆 XAUUSD | پلانی نوێ\n\n"
-        f"📊 ئاراستە: {plan['direction_text']}\n"
-        f"🎯 نرخی بایەس: {plan['reference']:.2f}\n\n"
-        "⭐ مامەڵەی سەرەکی:\n"
-        f"Entry: {main['entry']:.2f}\n"
-        f"TP: {main['tp']:.2f}\n\n"
-        "📍 چوار ئاستی زیادە:\n"
+    long_money = estimated_notional(
+        long_volume,
+        avg_long
     )
 
-    for index, trade in enumerate(extra, 1):
+    short_money = estimated_notional(
+        short_volume,
+        avg_short
+    )
 
-        message += (
-            f"{index}. {trade['entry']:.2f}"
-            f" → TP {trade['tp']:.2f}\n"
+    # BiQuote 1H liquidity estimate
+
+    candles = fetch_closed_candles("1h", 100)
+
+    liquidity = find_liquidity_zones(candles)
+
+    # Build report
+
+    message = (
+        "🦅 XAUUSD | MARKET POSITIONING REPORT\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🕗 کات: {now.strftime('%Y-%m-%d %H:%M')} بەغدا\n\n"
+
+        "📊 MYFXBOOK COMMUNITY\n"
+        "🟢 BUY POSITIONS\n"
+        f"• ژمارەی پۆزیشەن: {integer(long_positions)}\n"
+        f"• ڕێژە: {number(long_percent, 1)}%\n"
+        f"• قەبارە: {number(long_volume)} Lot\n"
+        f"• Average Entry: {number(avg_long, 2)}\n\n"
+
+        "🔴 SELL POSITIONS\n"
+        f"• ژمارەی پۆزیشەن: {integer(short_positions)}\n"
+        f"• ڕێژە: {number(short_percent, 1)}%\n"
+        f"• قەبارە: {number(short_volume)} Lot\n"
+        f"• Average Entry: {number(avg_short, 2)}\n\n"
+
+        "💵 ESTIMATED NOTIONAL VALUE\n"
+        f"🟢 BUY: ${number(long_money)}\n"
+        f"🔴 SELL: ${number(short_money)}\n\n"
+
+        "📍 MARKET LIQUIDITY ESTIMATE (1H)\n"
+        f"💰 نرخی دوا کاندڵ: {number(liquidity['current_price'])}\n\n"
+
+        + format_zones(
+            "🔴 ناوچەکانی سەرەوە:",
+            liquidity["resistance"]
         )
+        + "\n\n"
+        + format_zones(
+            "🟢 ناوچەکانی خوارەوە:",
+            liquidity["support"]
+        )
+        + "\n\n"
 
-    message += (
-        "\n💰 هەر TP = 100 پیپ\n"
-        "🏆 کاتێک 3 مامەڵە TP بکەن، "
-        "پلانی ئەم ڕۆژە کۆتایی دێت.\n\n"
-        "📊 Daily Decision: "
-        f"{plan['decision']}\n"
-        "📈 Expansion: "
-        f"{plan['expansion']}\n\n"
-        "⚠️ SIGNAL ONLY — NO ORDERS"
+        "📅 COT: داتای هەفتانە لەم وەشانەدا هێشتا پەیوەست نەکراوە.\n\n"
+
+        "⚠️ تێبینی:\n"
+        "• داتای Myfxbook تەنها بەشداربووانی کۆمەڵگەی خۆی دەگرێتەوە.\n"
+        "• ژمارەکان پۆزیشنن، نەک ژمارەی کەسەکان.\n"
+        "• Notional خەمڵاندنە بە بنەمای 100 oz بۆ هەر Lot.\n"
+        "• Liquidity ئاستی خەمڵێنراوە، ستۆپی ڕاستەقینە نییە.\n"
+        "• هیچ BUY/SELL signal یان ئۆردەرێک نییە.\n\n"
+
+        "📡 DATA: Myfxbook + BiQuote\n"
+        "🛑 REPORT ONLY — NO ORDERS"
     )
 
     return message
 
 
 # ==========================================
-# TRADE MONITORING
+# RUN REPORT
 # ==========================================
 
-def process_5m_candle(candle):
-
-    plan = state.get("plan")
-
-    if not plan or plan.get("finished"):
-        return
-
-    candle_time = candle["time"]
-
-    events = []
-
-    direction = plan["direction"]
-
-    for trade in plan["trades"]:
-
-        status = trade["status"]
-
-        entry = trade["entry"]
-
-        target = trade["tp"]
-
-        # WAITING -> ACTIVE
-
-        if status == "WAITING":
-
-            touched = (
-                candle["low"] <= entry
-                and candle["high"] >= entry
-            )
-
-            if touched:
-
-                trade["status"] = "ACTIVE"
-
-                trade["activated_time"] = candle_time
-
-                events.append(
-                    f"🟡 Entry {trade['number']}: "
-                    f"{entry:.2f} ACTIVE"
-                )
-
-        # ACTIVE -> TP
-
-        elif status == "ACTIVE":
-
-            # TP must occur on a later closed candle.
-
-            if candle_time == trade["activated_time"]:
-                continue
-
-            if direction == 1:
-
-                tp_hit = candle["high"] >= target
-
-            else:
-
-                tp_hit = candle["low"] <= target
-
-            if tp_hit:
-
-                trade["status"] = "TP"
-
-                trade["tp_time"] = candle_time
-
-                plan["tp_wins"] += 1
-
-                events.append(
-                    f"🏆 TP HIT | Entry: {entry:.2f} "
-                    f"| TP: {target:.2f}"
-                )
-
-    # Three successful trades close the daily plan.
-
-    if plan["tp_wins"] >= MAX_TP_WINS:
-
-        plan["finished"] = True
-
-        for trade in plan["trades"]:
-
-            if trade["status"] in ("WAITING", "ACTIVE"):
-
-                trade["status"] = "CANCELLED"
-
-        events.append(
-            "🏆 3 مامەڵە TP بوون.\n"
-            "🔒 پلانی ئەم ڕۆژە داخرا."
-        )
-
-    plan["last_5m_time"] = candle_time
-
-    save_state()
-
-    if events:
-
-        message = (
-            "🦅 XAUUSD | نوێکردنەوەی پلان\n\n"
-            + "\n".join(events)
-            + f"\n\n🏆 TP: {plan['tp_wins']}/3"
-            + "\n⚠️ SIGNAL ONLY — NO ORDERS"
-        )
-
-        send_message(message)
-
-        logging.info("Plan updated: %s", events)
-
-
-def monitor_plan():
-
-    plan = state.get("plan")
-
-    if not plan or plan.get("finished"):
-        return
+def run_report():
 
     try:
 
-        candles = fetch_closed_candles("5m", 100)
+        logging.info("Creating XAUUSD market report.")
 
-        last_time = plan.get("last_5m_time")
+        report = create_market_report()
 
-        new_candles = [
-            candle
-            for candle in candles
-            if time_key(candle["time"]) > time_key(last_time)
-        ]
+        if send_message(report):
 
-        for candle in new_candles:
-
-            if plan.get("finished"):
-                break
-
-            process_5m_candle(candle)
-
-    except Exception:
-
-        logging.exception("5M monitoring failed")
-
-
-# ==========================================
-# DAILY ANALYSIS
-# ==========================================
-
-def run_daily_analysis():
-
-    try:
-
-        result = analyze_daily()
-
-        bias = result["bias"]
-
-        if bias == "NEUTRAL":
-
-            message = (
-                "🦅 XAUUSD DAILY BIAS\n\n"
-                "🎯 DAILY BIAS: NEUTRAL\n\n"
-                f"Decision: {result['decision']}\n"
-                f"Expansion: {result['expansion']}\n"
-                f"Contracting: "
-                f"{'YES' if result['contracting'] else 'NO'}\n\n"
-                f"BUY votes: {result['buy_votes']}/2\n"
-                f"SELL votes: {result['sell_votes']}/2\n\n"
-                "⚪ هیچ پلانی بۆ ئەم ڕۆژە دروست نەکرا.\n\n"
-                "⚠️ SIGNAL ONLY — NO ORDERS"
-            )
-
-            return send_message(message)
-
-        # Create plan for BUY or SELL.
-
-        plan = create_daily_plan(result)
-
-        if not plan:
-            return False
-
-        state["plan"] = plan
-
-        save_state()
-
-        message = make_plan_message(plan)
-
-        if send_message(message):
-
-            logging.info(
-                "New daily plan created: %s",
-                bias
-            )
-
+            logging.info("Market report sent successfully.")
             return True
 
         return False
 
     except Exception as error:
 
-        logging.exception("Daily analysis failed")
+        logging.exception("Market report failed.")
 
         send_message(
-            "⚠️ XAUUSD DAILY ANALYSIS ERROR\n\n"
+            "⚠️ XAUUSD MARKET REPORT ERROR\n\n"
             f"{str(error)}\n\n"
-            "No new plan was created."
+            "ڕاپۆرتەکە بە سەرکەوتوویی ئامادە نەکرا."
         )
 
         return False
 
 
 # ==========================================
-# TELEGRAM STATUS
+# STATUS
 # ==========================================
 
 def get_status_message():
 
     now = datetime.now(BAGHDAD)
 
-    plan = state.get("plan")
-
-    message = (
-        "🟡 XAUUSD BOT STATUS\n\n"
-        "Mode: DAILY BIAS + 5 LEVELS\n"
-        "Data: BiQuote\n"
-        "Daily TF: 1D\n"
-        "Monitoring TF: 5M\n"
-        "Schedule: 07:00 Baghdad\n"
-        f"Baghdad: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"Last daily date: {state.get('last_daily_date')}\n"
+    return (
+        "🦅 XAUUSD MARKET REPORT BOT\n\n"
+        "Mode: MARKET POSITIONING REPORT\n"
+        "Sources: Myfxbook + BiQuote\n"
+        "Liquidity TF: 1H\n"
+        "Schedule: 08:00 Baghdad\n"
+        "Signals: DISABLED\n"
+        "Orders: DISABLED\n\n"
+        f"Baghdad Time: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"Last Report: {state.get('last_report_date')}\n\n"
+        "🛑 REPORT ONLY — NO ORDERS"
     )
-
-    if not plan:
-
-        message += "\n📊 No active daily plan."
-
-    else:
-
-        message += (
-            f"\n📊 Bias: {plan['bias']}"
-            f"\n🎯 Reference: {plan['reference']:.2f}"
-            f"\n🏆 TP: {plan['tp_wins']}/3"
-            f"\n🔒 Finished: {plan['finished']}\n"
-        )
-
-        for trade in plan["trades"]:
-
-            message += (
-                f"\nLevel {trade['number']}: "
-                f"{trade['entry']:.2f}"
-                f" | {trade['status']}"
-            )
-
-    message += "\n\n⚠️ SIGNAL ONLY — NO ORDERS"
-
-    return message
 
 
 # ==========================================
@@ -780,59 +702,37 @@ def handle_commands():
     for update in updates:
 
         state["telegram_offset"] = update["update_id"]
-
         save_state()
 
         message = update.get("message", {})
-
         chat = message.get("chat", {})
 
-        text = message.get("text", "").strip()
+        command = message.get("text", "").strip()
 
-        if not text:
+        if not command:
             continue
 
         if str(chat.get("id")) != str(CHAT_ID):
             continue
 
-        if text == "/start":
+        if command == "/start":
 
             send_message(
-                "🦅 XAUUSD DAILY BIAS BOT\n\n"
-                "/daily - Analyze and create plan\n"
-                "/status - Bot status\n\n"
-                "Daily: 07:00 Baghdad\n"
-                "Monitoring: 5M\n"
-                "SIGNAL ONLY — NO ORDERS"
+                "🦅 XAUUSD MARKET REPORT BOT\n\n"
+                "/report - ناردنی ڕاپۆرتی ئێستا\n"
+                "/status - دۆخی بۆت\n\n"
+                "Daily Report: 08:00 Baghdad\n"
+                "Sources: Myfxbook + BiQuote\n\n"
+                "REPORT ONLY — NO ORDERS"
             )
 
-        elif text == "/daily":
+        elif command == "/report":
 
-            today = datetime.now(BAGHDAD).strftime("%Y-%m-%d")
+            send_message("⏳ ڕاپۆرت ئامادە دەکرێت...")
 
-            current_plan = state.get("plan")
+            run_report()
 
-            if (
-                current_plan
-                and current_plan.get("date") == today
-            ):
-
-                send_message(
-                    "⚠️ پلانی ئەمڕۆ پێشتر دروست کراوە.\n\n"
-                    "بۆ بینینی دۆخەکە /status بنێرە."
-                )
-
-            else:
-
-                send_message("⏳ Daily analysis starting...")
-
-                if run_daily_analysis():
-
-                    state["last_daily_date"] = today
-
-                    save_state()
-
-        elif text == "/status":
+        elif command == "/status":
 
             send_message(get_status_message())
 
@@ -853,16 +753,15 @@ def check_daily_schedule():
         return
 
     if (
-        now.hour >= DAILY_HOUR
-        and state.get("last_daily_date") != today
+        now.hour >= REPORT_HOUR
+        and state.get("last_report_date") != today
     ):
 
-        logging.info("Starting scheduled daily analysis.")
+        logging.info("Scheduled 08:00 report started.")
 
-        if run_daily_analysis():
+        if run_report():
 
-            state["last_daily_date"] = today
-
+            state["last_report_date"] = today
             save_state()
 
 
@@ -873,21 +772,25 @@ def check_daily_schedule():
 def main():
 
     logging.info(
-        "XAUUSD Daily Bias Bot started — SIGNAL ONLY."
+        "XAUUSD Market Positioning Bot started."
     )
 
     if not BOT_TOKEN or not CHAT_ID:
-
         logging.error(
             "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID."
         )
 
+    if not MYFXBOOK_EMAIL or not MYFXBOOK_PASSWORD:
+        logging.error(
+            "Set MYFXBOOK_EMAIL and MYFXBOOK_PASSWORD."
+        )
+
     send_message(
-        "🦅 XAUUSD BOT STARTED\n\n"
-        "Mode: DAILY BIAS + 5 LEVELS\n"
-        "Schedule: 07:00 Baghdad\n"
-        "Monitoring: 5M\n\n"
-        "SIGNAL ONLY — NO ORDERS"
+        "🦅 XAUUSD MARKET REPORT BOT STARTED\n\n"
+        "Daily Report: 08:00 Baghdad\n"
+        "Sources: Myfxbook + BiQuote\n"
+        "Signals: DISABLED\n"
+        "Orders: DISABLED"
     )
 
     while True:
@@ -895,10 +798,7 @@ def main():
         try:
 
             handle_commands()
-
             check_daily_schedule()
-
-            monitor_plan()
 
         except Exception:
 
