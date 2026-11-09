@@ -1,6 +1,8 @@
+
 import os
 import time
 import json
+import math
 import logging
 import requests
 
@@ -24,13 +26,14 @@ RSI_PERIOD = 14
 BUY_RSI = 30
 SELL_RSI = 70
 
-# XAUUSD: 10 pips = $1.00
+# 10 pips = $1.00
 PIP_SIZE = 0.10
 
 TARGET_PIPS = [40, 60, 80, 100]
 
 POLL_SECONDS = 2
-STATE_FILE = "bot_state.json"
+
+STATE_FILE = os.getenv("STATE_FILE", "bot_state.json")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,7 +41,6 @@ logging.basicConfig(
 )
 
 session = requests.Session()
-
 telegram_offset = 0
 
 
@@ -47,7 +49,6 @@ telegram_offset = 0
 # =====================================
 
 def default_state():
-
     return {
         "bias": None,
         "armed": False,
@@ -57,24 +58,19 @@ def default_state():
 
 
 def load_state():
-
     if not os.path.exists(STATE_FILE):
         return default_state()
 
     try:
-
         with open(STATE_FILE, "r") as file:
-            state = json.load(file)
+            saved = json.load(file)
 
-        default = default_state()
-        default.update(state)
-
-        return default
+        result = default_state()
+        result.update(saved)
+        return result
 
     except Exception:
-
         logging.exception("Could not load state")
-
         return default_state()
 
 
@@ -82,14 +78,11 @@ state = load_state()
 
 
 def save_state():
-
     try:
-
         with open(STATE_FILE, "w") as file:
             json.dump(state, file, indent=4)
 
     except Exception:
-
         logging.exception("Could not save state")
 
 
@@ -98,7 +91,6 @@ def save_state():
 # =====================================
 
 def telegram_request(method, data=None):
-
     if not TELEGRAM_TOKEN:
         return None
 
@@ -108,7 +100,6 @@ def telegram_request(method, data=None):
     )
 
     try:
-
         response = session.post(
             url,
             data=data or {},
@@ -117,8 +108,9 @@ def telegram_request(method, data=None):
 
         if response.status_code != 200:
             logging.error(
-                "Telegram HTTP error: %s",
-                response.status_code
+                "Telegram HTTP error: %s %s",
+                response.status_code,
+                response.text[:300]
             )
             return None
 
@@ -134,14 +126,11 @@ def telegram_request(method, data=None):
         return result.get("result")
 
     except Exception:
-
         logging.exception("Telegram connection failed")
-
         return None
 
 
 def send_message(message):
-
     if not TELEGRAM_CHAT_ID:
         return False
 
@@ -161,9 +150,13 @@ def send_message(message):
 # =====================================
 
 def number(value):
-
     try:
-        return float(value or 0)
+        result = float(value)
+
+        if not math.isfinite(result):
+            return 0.0
+
+        return result
 
     except (TypeError, ValueError):
         return 0.0
@@ -180,7 +173,9 @@ def extract_candles(data):
 
     if isinstance(data, dict):
 
+        # Official BiQuote response uses "bars".
         for key in (
+            "bars",
             "data",
             "candles",
             "ohlc",
@@ -192,7 +187,62 @@ def extract_candles(data):
             if isinstance(value, list):
                 return value
 
-    raise RuntimeError("Could not read 5M candles")
+            if isinstance(value, dict):
+                for nested_key in ("bars", "candles", "data"):
+                    nested = value.get(nested_key)
+
+                    if isinstance(nested, list):
+                        return nested
+
+        raise RuntimeError(
+            "No candle list found. Response keys: "
+            + str(list(data.keys()))
+        )
+
+    raise RuntimeError(
+        "Unexpected BiQuote response type: "
+        + str(type(data).__name__)
+    )
+
+
+def sort_candles(candles):
+
+    valid = []
+
+    for candle in candles:
+
+        if not isinstance(candle, dict):
+            continue
+
+        close = number(candle.get("close"))
+
+        if close <= 0:
+            continue
+
+        valid.append(candle)
+
+    if not valid:
+        raise RuntimeError("No valid candles found")
+
+    # BiQuote normally returns newest candles first.
+    # Sort by openTime so RSI uses oldest to newest.
+    try:
+
+        valid.sort(
+            key=lambda candle: datetime.fromisoformat(
+                str(candle["openTime"]).replace("Z", "+00:00")
+            )
+        )
+
+    except (KeyError, ValueError, TypeError):
+
+        logging.warning(
+            "Candle timestamps unavailable; reversing API order"
+        )
+
+        valid.reverse()
+
+    return valid
 
 
 def get_5m_candles():
@@ -200,23 +250,36 @@ def get_5m_candles():
     response = session.get(
         BIQUOTE_URL,
         params={
-            "timeframe": TIMEFRAME,
+            "interval": TIMEFRAME,
             "limit": 200
         },
         timeout=15
     )
 
     if response.status_code != 200:
+
         raise RuntimeError(
-            f"BiQuote HTTP {response.status_code}"
+            f"BiQuote HTTP {response.status_code}: "
+            f"{response.text[:300]}"
         )
 
-    data = response.json()
+    try:
+        data = response.json()
+
+    except ValueError:
+        raise RuntimeError(
+            "BiQuote returned invalid JSON: "
+            + response.text[:300]
+        )
 
     candles = extract_candles(data)
+    candles = sort_candles(candles)
 
-    if len(candles) < RSI_PERIOD + 2:
-        raise RuntimeError("Not enough 5M candles")
+    if len(candles) < RSI_PERIOD + 1:
+
+        raise RuntimeError(
+            f"Not enough 5M candles: {len(candles)}"
+        )
 
     return candles
 
@@ -235,13 +298,10 @@ def calculate_rsi(candles):
     if len(closes) < RSI_PERIOD + 1:
         raise RuntimeError("Not enough RSI data")
 
-    changes = []
-
-    for i in range(1, len(closes)):
-
-        changes.append(
-            closes[i] - closes[i - 1]
-        )
+    changes = [
+        closes[i] - closes[i - 1]
+        for i in range(1, len(closes))
+    ]
 
     gains = [
         max(change, 0)
@@ -256,6 +316,7 @@ def calculate_rsi(candles):
     avg_gain = sum(gains[:RSI_PERIOD]) / RSI_PERIOD
     avg_loss = sum(losses[:RSI_PERIOD]) / RSI_PERIOD
 
+    # Wilder RSI smoothing
     for i in range(RSI_PERIOD, len(gains)):
 
         avg_gain = (
@@ -294,7 +355,6 @@ def calculate_targets(direction, entry):
 
         if direction == "BUY":
             price = entry + distance
-
         else:
             price = entry - distance
 
@@ -312,10 +372,7 @@ def calculate_targets(direction, entry):
 
 def create_signal(direction, entry, rsi):
 
-    targets = calculate_targets(
-        direction,
-        entry
-    )
+    targets = calculate_targets(direction, entry)
 
     state["trade"] = {
         "direction": direction,
@@ -341,7 +398,7 @@ def create_signal(direction, entry, rsi):
 
         target_text += (
             f"🎯 TP{i}: {target['price']:.2f} "
-            f"(+{target['pips']} pip)\n"
+            f"({target['pips']} pip)\n"
         )
 
     message = (
@@ -362,9 +419,10 @@ def create_signal(direction, entry, rsi):
     send_message(message)
 
     logging.info(
-        "%s signal created at %.2f",
+        "%s signal created at %.2f RSI=%.2f",
         direction,
-        entry
+        entry,
+        rsi
     )
 
 
@@ -380,23 +438,17 @@ def monitor_targets(current_price):
         return
 
     direction = trade["direction"]
-
     targets = trade["targets"]
-
     next_target = trade["next_target"]
 
     while next_target < len(targets):
 
         target = targets[next_target]
-
         target_price = target["price"]
 
         if direction == "BUY":
-
             reached = current_price >= target_price
-
         else:
-
             reached = current_price <= target_price
 
         if not reached:
@@ -413,7 +465,7 @@ def monitor_targets(current_price):
             f"💵 Current Price: {current_price:.2f}\n\n"
 
             f"🏆 TP{next_target + 1} COMPLETED\n"
-            f"💰 Profit Distance: +{pips} PIPS\n"
+            f"💰 Profit Distance: {pips} PIPS\n"
             f"🎯 Target Price: {target_price:.2f}\n"
         )
 
@@ -435,7 +487,6 @@ def monitor_targets(current_price):
         send_message(message)
 
         next_target += 1
-
         trade["next_target"] = next_target
 
         save_state()
@@ -450,7 +501,6 @@ def monitor_targets(current_price):
         if state["pending_rearm"]:
 
             state["armed"] = True
-
             state["pending_rearm"] = False
 
             send_message(
@@ -489,18 +539,16 @@ def monitor_market():
 
     latest = candles[-1]
 
-    current_price = number(
-        latest.get("close")
-    )
+    # Latest bar can be the currently open 5M candle.
+    current_price = number(latest.get("close"))
 
     if current_price <= 0:
-        return
+        raise RuntimeError("Invalid current XAUUSD price")
 
     # First monitor an active trade.
     if state.get("trade"):
 
         monitor_targets(current_price)
-
         return
 
     # No active trade: calculate RSI.
@@ -509,10 +557,11 @@ def monitor_market():
     direction = state["bias"]
 
     logging.info(
-        "Bias=%s RSI=%.2f Price=%.2f",
+        "Bias=%s RSI=%.2f Price=%.2f Candles=%s",
         direction,
         rsi,
-        current_price
+        current_price,
+        len(candles)
     )
 
     # BUY condition.
@@ -546,7 +595,6 @@ def set_bias(direction):
 
     if state.get("trade"):
 
-        # Store the new bias for after the active trade.
         state["pending_rearm"] = True
 
         save_state()
@@ -597,17 +645,14 @@ def set_bias(direction):
 def send_status():
 
     bias = state.get("bias") or "NOT SET"
-
     trade = state.get("trade")
 
     if trade:
 
-        completed = trade["next_target"]
-
         status = (
             f"Active Trade: {trade['direction']}\n"
             f"Entry: {trade['entry']:.2f}\n"
-            f"Targets Completed: {completed}/4\n"
+            f"Targets Completed: {trade['next_target']}/4\n"
         )
 
     else:
@@ -683,7 +728,7 @@ def handle_message(message):
 
         send_status()
 
-    elif normalized == "/START" or normalized == "/HELP":
+    elif normalized in ("/START", "/HELP"):
 
         send_message(
             "🦅 XAUUSD RSI BOT\n"
@@ -783,7 +828,6 @@ def main():
                 if message:
                     handle_message(message)
 
-            # Check RSI and active targets.
             try:
 
                 monitor_market()
