@@ -1,38 +1,32 @@
+
 import os
 import time
-import json
 import logging
 import requests
 
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-# ==========================================
-# XAUUSD MARKET POSITIONING BOT
-# REPORT ONLY — NO SIGNALS — NO ORDERS
-# ==========================================
-
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-MYFXBOOK_EMAIL = os.getenv("MYFXBOOK_EMAIL")
-MYFXBOOK_PASSWORD = os.getenv("MYFXBOOK_PASSWORD")
-
-MYFXBOOK_API = "https://www.myfxbook.com/api"
-DATA_URL = "https://biquote.io/api/XAUUSD/ohlc"
-TELEGRAM_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# =========================
+# CONFIGURATION
+# =========================
 
 BAGHDAD = ZoneInfo("Asia/Baghdad")
 
-POLL_SECONDS = 15
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+MYFXBOOK_EMAIL = os.getenv("MYFXBOOK_EMAIL", "").strip()
+MYFXBOOK_PASSWORD = os.getenv("MYFXBOOK_PASSWORD", "").strip()
+
+MYFXBOOK_API = "https://www.myfxbook.com/api"
+BIQUOTE_URL = "https://biquote.io/api/XAUUSD/ohlc"
+
 REPORT_HOUR = 8
+REPORT_MINUTE = 0
 
-# خەمڵاندنی Notional:
-# 1 standard lot = 100 oz ـی زێڕ
-# ئەمە پێویستە لەگەڵ contract size ـی سەرچاوەکە بگونجێت.
-GOLD_OZ_PER_LOT = 100
-
-STATE_FILE = os.getenv("STATE_FILE", "market_report_state.json")
+POLL_SECONDS = 5
+CANDLE_LIMIT = 200
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,147 +34,122 @@ logging.basicConfig(
 )
 
 session = requests.Session()
-session.headers.update({
-    "User-Agent": "XAUUSD-Market-Report-Bot"
-})
+telegram_offset = 0
+last_report_date = None
 
 
-# ==========================================
-# STATE
-# ==========================================
-
-def load_state():
-    try:
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {
-            "last_report_date": None,
-            "telegram_offset": 0
-        }
-
-
-state = load_state()
-
-
-def save_state():
-    try:
-        directory = os.path.dirname(STATE_FILE)
-
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-
-        temp_file = STATE_FILE + ".tmp"
-
-        with open(temp_file, "w") as f:
-            json.dump(state, f, indent=2)
-
-        os.replace(temp_file, STATE_FILE)
-
-    except Exception:
-        logging.exception("State save failed")
-
-
-# ==========================================
+# =========================
 # TELEGRAM
-# ==========================================
+# =========================
 
-def send_message(message):
+def telegram_request(method, data=None):
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
 
-    if not BOT_TOKEN or not CHAT_ID:
-        logging.error("Telegram variables missing.")
-        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
 
     try:
         response = session.post(
-            f"{TELEGRAM_URL}/sendMessage",
-            json={
-                "chat_id": CHAT_ID,
-                "text": message
-            },
+            url,
+            data=data or {},
             timeout=20
         )
 
-        response.raise_for_status()
+        if response.status_code != 200:
+            logging.error(
+                "Telegram API returned HTTP %s",
+                response.status_code
+            )
+            return None
 
         result = response.json()
 
         if not result.get("ok"):
-            logging.error("Telegram error: %s", result)
-            return False
+            logging.error("Telegram API returned an unsuccessful response")
+            return None
 
-        return True
+        return result.get("result")
 
-    except Exception:
-        logging.exception("Telegram send failed")
-        return False
+    except requests.RequestException:
+        logging.error("Telegram connection error")
+        return None
 
 
-def get_updates():
+def send_message(message):
+    if not TELEGRAM_CHAT_ID:
+        logging.error("TELEGRAM_CHAT_ID is missing")
+        return
 
-    if not BOT_TOKEN:
-        return []
+    telegram_request(
+        "sendMessage",
+        {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message
+        }
+    )
+
+
+# =========================
+# MYFXBOOK
+# =========================
+
+def myfxbook_request(endpoint, params):
+    url = f"{MYFXBOOK_API}/{endpoint}"
 
     try:
         response = session.get(
-            f"{TELEGRAM_URL}/getUpdates",
-            params={
-                "offset": state.get("telegram_offset", 0) + 1,
-                "timeout": 5
-            },
-            timeout=10
+            url,
+            params=params,
+            timeout=25
         )
 
-        response.raise_for_status()
+    except requests.Timeout:
+        raise RuntimeError("Myfxbook connection timed out")
 
+    except requests.RequestException:
+        raise RuntimeError("Myfxbook connection failed")
+
+    if response.status_code == 429:
+        raise RuntimeError(
+            "Myfxbook rate limit: HTTP 429. Wait before trying again."
+        )
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Myfxbook API returned HTTP {response.status_code}"
+        )
+
+    try:
         data = response.json()
-
-        if data.get("ok"):
-            return data.get("result", [])
-
-    except Exception:
-        logging.exception("Telegram updates failed")
-
-    return []
-
-
-# ==========================================
-# MYFXBOOK
-# ==========================================
-
-def myfxbook_request(method, params=None):
-
-    url = f"{MYFXBOOK_API}/{method}.json"
-
-    response = session.get(
-        url,
-        params=params or {},
-        timeout=30
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
+    except ValueError:
+        raise RuntimeError("Myfxbook returned invalid data")
 
     if data.get("error"):
-        raise RuntimeError(
-            data.get("message") or "Myfxbook API error"
-        )
+        message = str(data.get("message", "API error"))
+
+        # Never send raw URLs, credentials, or API response details.
+        safe_messages = {
+            "Invalid credentials",
+            "Invalid session",
+            "Invalid symbol"
+        }
+
+        if message in safe_messages:
+            raise RuntimeError(message)
+
+        raise RuntimeError("Myfxbook API rejected the request")
 
     return data
 
 
-def get_myfxbook_gold_data():
-
+def get_myfxbook_outlook():
     if not MYFXBOOK_EMAIL or not MYFXBOOK_PASSWORD:
         raise RuntimeError(
-            "MYFXBOOK_EMAIL or MYFXBOOK_PASSWORD is missing."
+            "MYFXBOOK_EMAIL or MYFXBOOK_PASSWORD is missing"
         )
 
-    # Login to Myfxbook
-
     login_data = myfxbook_request(
-        "login",
+        "login.json",
         {
             "email": MYFXBOOK_EMAIL,
             "password": MYFXBOOK_PASSWORD
@@ -190,600 +159,384 @@ def get_myfxbook_gold_data():
     api_session = login_data.get("session")
 
     if not api_session:
-        raise RuntimeError("Myfxbook login failed: no session.")
+        raise RuntimeError("Myfxbook login did not return a session")
 
     try:
-
-        outlook = myfxbook_request(
-            "get-community-outlook",
+        outlook_data = myfxbook_request(
+            "get-community-outlook.json",
             {
                 "session": api_session
             }
         )
 
-        symbols = outlook.get("symbols", [])
-
-        gold = None
+        symbols = outlook_data.get("symbols", [])
 
         for item in symbols:
-
             symbol_name = str(item.get("name", "")).upper()
 
-            if symbol_name == "XAUUSD":
-                gold = item
-                break
+            if symbol_name in ("XAUUSD", "GOLD"):
+                return item
 
-        if not gold:
-            raise RuntimeError(
-                "XAUUSD was not found in Myfxbook community outlook."
-            )
-
-        return gold
+        raise RuntimeError("XAUUSD was not found in Myfxbook data")
 
     finally:
-
-        # Revoke session after collecting the data.
-
+        # Logout is best-effort. Never expose the session or URL.
         try:
-            myfxbook_request(
-                "logout",
-                {
-                    "session": api_session
-                }
+            session.get(
+                f"{MYFXBOOK_API}/logout.json",
+                params={"session": api_session},
+                timeout=10
             )
-        except Exception:
-            logging.warning("Myfxbook logout failed.")
+        except requests.RequestException:
+            logging.warning("Myfxbook logout request failed")
 
 
-# ==========================================
-# MARKET CANDLES
-# ==========================================
+# =========================
+# FORMAT HELPERS
+# =========================
 
-def find_bars(data):
+def number(value):
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
+
+def format_number(value, decimals=2):
+    return f"{number(value):,.{decimals}f}"
+
+
+def calculate_notional(lots, average_price):
+    # Estimate only: assumes 1 standard lot = 100 oz of gold.
+    return number(lots) * 100 * number(average_price)
+
+
+def build_position_report(item):
+    long_positions = number(item.get("longPositions"))
+    short_positions = number(item.get("shortPositions"))
+
+    long_volume = number(item.get("longVolume"))
+    short_volume = number(item.get("shortVolume"))
+
+    long_percentage = number(item.get("longPercentage"))
+    short_percentage = number(item.get("shortPercentage"))
+
+    avg_long = number(item.get("avgLongPrice"))
+    avg_short = number(item.get("avgShortPrice"))
+
+    long_notional = calculate_notional(long_volume, avg_long)
+    short_notional = calculate_notional(short_volume, avg_short)
+
+    total_positions = long_positions + short_positions
+    total_volume = long_volume + short_volume
+
+    if total_positions > 0:
+        long_position_share = long_positions / total_positions * 100
+        short_position_share = short_positions / total_positions * 100
+    else:
+        long_position_share = 0
+        short_position_share = 0
+
+    if total_volume > 0:
+        long_volume_share = long_volume / total_volume * 100
+        short_volume_share = short_volume / total_volume * 100
+    else:
+        long_volume_share = 0
+        short_volume_share = 0
+
+    report = (
+        "🦅 XAUUSD MARKET POSITIONING\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "🟢 BUY POSITIONS\n"
+        f"Positions: {long_positions:,.0f}\n"
+        f"Share: {long_percentage:.2f}%\n"
+        f"Lots: {long_volume:,.2f}\n"
+        f"Average Entry: {avg_long:.2f}\n"
+        f"Estimated Notional: ${long_notional:,.0f}\n\n"
+        "🔴 SELL POSITIONS\n"
+        f"Positions: {short_positions:,.0f}\n"
+        f"Share: {short_percentage:.2f}%\n"
+        f"Lots: {short_volume:,.2f}\n"
+        f"Average Entry: {avg_short:.2f}\n"
+        f"Estimated Notional: ${short_notional:,.0f}\n\n"
+        "📊 POSITION DISTRIBUTION\n"
+        f"BUY positions: {long_position_share:.2f}%\n"
+        f"SELL positions: {short_position_share:.2f}%\n"
+        f"BUY volume: {long_volume_share:.2f}%\n"
+        f"SELL volume: {short_volume_share:.2f}%\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "⚠️ These figures represent Myfxbook community data, "
+        "not the entire global gold market.\n"
+        "Notional values are estimates based on 100 oz per standard lot. "
+        "They are not actual cash invested or margin."
+    )
+
+    return report
+
+
+# =========================
+# BIQUOTE 1H DATA
+# =========================
+
+def extract_candles(data):
     if isinstance(data, list):
-
-        if data and isinstance(data[0], dict):
-            return data
-
-        return []
+        return data
 
     if isinstance(data, dict):
-
-        for key in (
-            "bars",
-            "candles",
-            "data",
-            "result",
-            "ohlc",
-            "prices"
-        ):
-
+        for key in ("data", "candles", "ohlc", "result"):
             value = data.get(key)
-
             if isinstance(value, list):
+                return value
 
-                if value and isinstance(value[0], dict):
-                    return value
-
-            if isinstance(value, dict):
-
-                found = find_bars(value)
-
-                if found:
-                    return found
-
-    return []
+    raise RuntimeError("Could not read BiQuote candle data")
 
 
-def get_value(candle, *names):
+def get_hourly_candles():
+    try:
+        response = session.get(
+            BIQUOTE_URL,
+            params={"timeframe": "1h", "limit": CANDLE_LIMIT},
+            timeout=20
+        )
 
-    for name in names:
+    except requests.RequestException:
+        raise RuntimeError("BiQuote connection failed")
 
-        if name in candle and candle[name] is not None:
-            return candle[name]
-
-    return None
-
-
-def time_key(value):
-
-    value = str(value)
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"BiQuote returned HTTP {response.status_code}"
+        )
 
     try:
-        return (0, float(value))
-    except (ValueError, TypeError):
-        return (1, value)
+        data = response.json()
+    except ValueError:
+        raise RuntimeError("BiQuote returned invalid data")
 
+    candles = extract_candles(data)
 
-def fetch_closed_candles(interval="1h", limit=100):
-
-    response = session.get(
-        DATA_URL,
-        params={
-            "interval": interval,
-            "limit": limit
-        },
-        timeout=25
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    bars = find_bars(data)
-
-    closed = []
-
-    for candle in bars:
-
-        is_open = get_value(
-            candle,
-            "isOpen",
-            "is_open"
-        )
-
-        # تەنها کاندڵی داخراو و پشتڕاستکراو
-
-        if is_open is not False:
-            continue
-
-        try:
-
-            candle_time = get_value(
-                candle,
-                "openTime",
-                "time",
-                "timestamp",
-                "datetime",
-                "date",
-                "open_time",
-                "t"
-            )
-
-            if candle_time is None:
-                continue
-
-            item = {
-                "time": str(candle_time),
-                "open": float(get_value(
-                    candle, "open", "Open", "o"
-                )),
-                "high": float(get_value(
-                    candle, "high", "High", "h"
-                )),
-                "low": float(get_value(
-                    candle, "low", "Low", "l"
-                )),
-                "close": float(get_value(
-                    candle, "close", "Close", "c"
-                ))
-            }
-
-            closed.append(item)
-
-        except (TypeError, ValueError):
-            continue
-
-    unique = {
-        item["time"]: item
-        for item in closed
-    }
-
-    candles = sorted(
-        unique.values(),
-        key=lambda x: time_key(x["time"])
-    )
+    # Use only closed candles when the API provides an isOpen field.
+    if candles and isinstance(candles[-1], dict):
+        if "isOpen" in candles[-1]:
+            candles = [
+                candle for candle in candles
+                if not candle.get("isOpen", False)
+            ]
+        else:
+            # Without an isOpen field, exclude the newest candle
+            # because it may still be forming.
+            candles = candles[:-1]
 
     if len(candles) < 10:
-        raise ValueError(
-            f"Not enough closed {interval} candles."
-        )
+        raise RuntimeError("Not enough closed 1H candles")
 
     return candles
 
 
-# ==========================================
-# LIQUIDITY ESTIMATION
-# ==========================================
-
-def find_liquidity_zones(candles):
-
-    current_price = candles[-1]["close"]
+def get_liquidity_zones():
+    candles = get_hourly_candles()
 
     highs = []
     lows = []
 
-    # Find local swing highs and lows.
-
     for i in range(2, len(candles) - 2):
+        current = candles[i]
 
-        previous = candles[i - 2:i]
-        following = candles[i + 1:i + 3]
+        try:
+            high = number(current.get("high"))
+            low = number(current.get("low"))
+        except AttributeError:
+            continue
 
-        candle = candles[i]
+        previous_highs = [
+            number(candles[j].get("high"))
+            for j in range(i - 2, i)
+        ]
 
-        is_swing_high = all(
-            candle["high"] > item["high"]
-            for item in previous + following
-        )
+        next_highs = [
+            number(candles[j].get("high"))
+            for j in range(i + 1, i + 3)
+        ]
 
-        is_swing_low = all(
-            candle["low"] < item["low"]
-            for item in previous + following
-        )
+        previous_lows = [
+            number(candles[j].get("low"))
+            for j in range(i - 2, i)
+        ]
 
-        if is_swing_high:
-            highs.append(candle["high"])
+        next_lows = [
+            number(candles[j].get("low"))
+            for j in range(i + 1, i + 3)
+        ]
 
-        if is_swing_low:
-            lows.append(candle["low"])
+        if high > max(previous_highs + next_highs):
+            highs.append(high)
 
-    # Add recent extremes.
+        if low < min(previous_lows + next_lows):
+            lows.append(low)
 
-    recent = candles[-24:]
+    last_close = number(candles[-1].get("close"))
 
-    highs.append(max(item["high"] for item in recent))
-    lows.append(min(item["low"] for item in recent))
+    if last_close <= 0:
+        raise RuntimeError("Could not read latest 1H price")
 
-    # Group nearby levels.
+    # Nearest swing highs above price and swing lows below price.
+    resistance_zones = sorted(
+        set(round(x, 2) for x in highs if x > last_close)
+    )[:3]
 
-    def group_levels(levels, tolerance=0.50):
-
-        groups = []
-
-        for price in sorted(levels):
-
-            matched = False
-
-            for group in groups:
-
-                average = sum(group) / len(group)
-
-                if abs(price - average) <= tolerance:
-
-                    group.append(price)
-                    matched = True
-                    break
-
-            if not matched:
-                groups.append([price])
-
-        results = []
-
-        for group in groups:
-
-            average = sum(group) / len(group)
-
-            results.append({
-                "price": round(average, 2),
-                "touches": len(group)
-            })
-
-        return results
-
-    high_zones = group_levels(highs)
-    low_zones = group_levels(lows)
-
-    resistance_zones = [
-        item for item in high_zones
-        if item["price"] > current_price
-    ]
-
-    support_zones = [
-        item for item in low_zones
-        if item["price"] < current_price
-    ]
-
-    resistance_zones.sort(
-        key=lambda x: x["price"]
-    )
-
-    support_zones.sort(
-        key=lambda x: x["price"],
+    support_zones = sorted(
+        set(round(x, 2) for x in lows if x < last_close),
         reverse=True
-    )
+    )[:3]
 
-    return {
-        "current_price": current_price,
-        "resistance": resistance_zones[:3],
-        "support": support_zones[:3]
-    }
+    return last_close, resistance_zones, support_zones
 
 
-# ==========================================
-# FORMAT HELPERS
-# ==========================================
-
-def number(value, decimals=2):
-
-    try:
-        return f"{float(value):,.{decimals}f}"
-    except (TypeError, ValueError):
-        return "N/A"
-
-
-def integer(value):
-
-    try:
-        return f"{int(float(value)):,}"
-    except (TypeError, ValueError):
-        return "N/A"
-
-
-def estimated_notional(lots, average_price):
-
-    try:
-
-        return (
-            float(lots)
-            * GOLD_OZ_PER_LOT
-            * float(average_price)
-        )
-
-    except (TypeError, ValueError):
-        return None
-
-
-def format_zones(title, zones):
-
-    lines = [title]
-
+def format_zones(zones):
     if not zones:
-        lines.append("• هیچ ئاستێکی دیاریکراو نییە.")
-        return "\n".join(lines)
+        return "Not available"
 
-    for item in zones:
+    return " | ".join(f"{level:.2f}" for level in zones)
 
-        lines.append(
-            f"• {item['price']:.2f}"
-            f" — {item['touches']} جار"
+
+# =========================
+# COMPLETE REPORT
+# =========================
+
+def generate_report():
+    item = get_myfxbook_outlook()
+
+    positioning = build_position_report(item)
+
+    try:
+        price, resistances, supports = get_liquidity_zones()
+
+        liquidity = (
+            "\n\n🧭 ESTIMATED LIQUIDITY AREAS (1H)\n"
+            f"Reference Price: {price:.2f}\n"
+            f"Potential High Zones: {format_zones(resistances)}\n"
+            f"Potential Low Zones: {format_zones(supports)}\n\n"
+            "These are estimated swing-high/low areas, "
+            "not confirmed stop orders."
         )
 
-    return "\n".join(lines)
-
-
-# ==========================================
-# REPORT
-# ==========================================
-
-def create_market_report():
-
-    now = datetime.now(BAGHDAD)
-
-    # Myfxbook positioning
-
-    gold = get_myfxbook_gold_data()
-
-    long_positions = gold.get("longPositions")
-    short_positions = gold.get("shortPositions")
-
-    long_volume = gold.get("longVolume")
-    short_volume = gold.get("shortVolume")
-
-    long_percent = gold.get("longPercentage")
-    short_percent = gold.get("shortPercentage")
-
-    avg_long = gold.get("avgLongPrice")
-    avg_short = gold.get("avgShortPrice")
-
-    long_money = estimated_notional(
-        long_volume,
-        avg_long
-    )
-
-    short_money = estimated_notional(
-        short_volume,
-        avg_short
-    )
-
-    # BiQuote 1H liquidity estimate
-
-    candles = fetch_closed_candles("1h", 100)
-
-    liquidity = find_liquidity_zones(candles)
-
-    # Build report
-
-    message = (
-        "🦅 XAUUSD | MARKET POSITIONING REPORT\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"🕗 کات: {now.strftime('%Y-%m-%d %H:%M')} بەغدا\n\n"
-
-        "📊 MYFXBOOK COMMUNITY\n"
-        "🟢 BUY POSITIONS\n"
-        f"• ژمارەی پۆزیشەن: {integer(long_positions)}\n"
-        f"• ڕێژە: {number(long_percent, 1)}%\n"
-        f"• قەبارە: {number(long_volume)} Lot\n"
-        f"• Average Entry: {number(avg_long, 2)}\n\n"
-
-        "🔴 SELL POSITIONS\n"
-        f"• ژمارەی پۆزیشەن: {integer(short_positions)}\n"
-        f"• ڕێژە: {number(short_percent, 1)}%\n"
-        f"• قەبارە: {number(short_volume)} Lot\n"
-        f"• Average Entry: {number(avg_short, 2)}\n\n"
-
-        "💵 ESTIMATED NOTIONAL VALUE\n"
-        f"🟢 BUY: ${number(long_money)}\n"
-        f"🔴 SELL: ${number(short_money)}\n\n"
-
-        "📍 MARKET LIQUIDITY ESTIMATE (1H)\n"
-        f"💰 نرخی دوا کاندڵ: {number(liquidity['current_price'])}\n\n"
-
-        + format_zones(
-            "🔴 ناوچەکانی سەرەوە:",
-            liquidity["resistance"]
+    except Exception:
+        logging.warning("Could not calculate 1H liquidity estimates")
+        liquidity = (
+            "\n\n🧭 ESTIMATED LIQUIDITY AREAS (1H)\n"
+            "Temporarily unavailable."
         )
-        + "\n\n"
-        + format_zones(
-            "🟢 ناوچەکانی خوارەوە:",
-            liquidity["support"]
-        )
-        + "\n\n"
 
-        "📅 COT: داتای هەفتانە لەم وەشانەدا هێشتا پەیوەست نەکراوە.\n\n"
+    now = datetime.now(BAGHDAD).strftime("%Y-%m-%d %H:%M")
 
-        "⚠️ تێبینی:\n"
-        "• داتای Myfxbook تەنها بەشداربووانی کۆمەڵگەی خۆی دەگرێتەوە.\n"
-        "• ژمارەکان پۆزیشنن، نەک ژمارەی کەسەکان.\n"
-        "• Notional خەمڵاندنە بە بنەمای 100 oz بۆ هەر Lot.\n"
-        "• Liquidity ئاستی خەمڵێنراوە، ستۆپی ڕاستەقینە نییە.\n"
-        "• هیچ BUY/SELL signal یان ئۆردەرێک نییە.\n\n"
-
-        "📡 DATA: Myfxbook + BiQuote\n"
-        "🛑 REPORT ONLY — NO ORDERS"
+    footer = (
+        "\n\n━━━━━━━━━━━━━━━━━━\n"
+        "📅 " + now + " Baghdad\n"
+        "📌 Source: Myfxbook Community Outlook\n"
+        "📌 Price zones: BiQuote 1H candles\n"
+        "📌 COT: Not connected yet\n\n"
+        "⚪ REPORT ONLY\n"
+        "🚫 No BUY/SELL signals\n"
+        "🚫 No orders"
     )
 
-    return message
+    return positioning + liquidity + footer
 
-
-# ==========================================
-# RUN REPORT
-# ==========================================
 
 def run_report():
+    send_message("⏳ Preparing XAUUSD market report...")
 
     try:
+        report = generate_report()
+        send_message(report)
 
-        logging.info("Creating XAUUSD market report.")
-
-        report = create_market_report()
-
-        if send_message(report):
-
-            logging.info("Market report sent successfully.")
-            return True
-
-        return False
+    except RuntimeError as error:
+        # Only safe, controlled error messages are sent.
+        send_message(
+            "⚠️ XAUUSD REPORT ERROR\n\n"
+            f"{str(error)}\n\n"
+            "No credentials or request URLs are displayed."
+        )
 
     except Exception as error:
-
-        logging.exception("Market report failed.")
+        # Do not log raw exception text; it may contain request URLs.
+        logging.error(
+            "Report failed. Exception type: %s",
+            type(error).__name__
+        )
 
         send_message(
-            "⚠️ XAUUSD MARKET REPORT ERROR\n\n"
-            f"{str(error)}\n\n"
-            "ڕاپۆرتەکە بە سەرکەوتوویی ئامادە نەکرا."
+            "⚠️ Report could not be completed.\n"
+            "Check Railway logs for the safe error category."
         )
 
-        return False
 
+# =========================
+# TELEGRAM COMMANDS
+# =========================
 
-# ==========================================
-# STATUS
-# ==========================================
+def get_updates():
+    global telegram_offset
 
-def get_status_message():
-
-    now = datetime.now(BAGHDAD)
-
-    return (
-        "🦅 XAUUSD MARKET REPORT BOT\n\n"
-        "Mode: MARKET POSITIONING REPORT\n"
-        "Sources: Myfxbook + BiQuote\n"
-        "Liquidity TF: 1H\n"
-        "Schedule: 08:00 Baghdad\n"
-        "Signals: DISABLED\n"
-        "Orders: DISABLED\n\n"
-        f"Baghdad Time: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"Last Report: {state.get('last_report_date')}\n\n"
-        "🛑 REPORT ONLY — NO ORDERS"
+    result = telegram_request(
+        "getUpdates",
+        {
+            "offset": telegram_offset,
+            "timeout": 10,
+            "allowed_updates": '["message"]'
+        }
     )
 
-
-# ==========================================
-# TELEGRAM COMMANDS
-# ==========================================
-
-def handle_commands():
-
-    updates = get_updates()
-
-    for update in updates:
-
-        state["telegram_offset"] = update["update_id"]
-        save_state()
-
-        message = update.get("message", {})
-        chat = message.get("chat", {})
-
-        command = message.get("text", "").strip()
-
-        if not command:
-            continue
-
-        if str(chat.get("id")) != str(CHAT_ID):
-            continue
-
-        if command == "/start":
-
-            send_message(
-                "🦅 XAUUSD MARKET REPORT BOT\n\n"
-                "/report - ناردنی ڕاپۆرتی ئێستا\n"
-                "/status - دۆخی بۆت\n\n"
-                "Daily Report: 08:00 Baghdad\n"
-                "Sources: Myfxbook + BiQuote\n\n"
-                "REPORT ONLY — NO ORDERS"
-            )
-
-        elif command == "/report":
-
-            send_message("⏳ ڕاپۆرت ئامادە دەکرێت...")
-
-            run_report()
-
-        elif command == "/status":
-
-            send_message(get_status_message())
+    return result or []
 
 
-# ==========================================
-# DAILY SCHEDULE
-# ==========================================
+def handle_message(message):
+    text = message.get("text", "").strip()
+    chat_id = str(message.get("chat", {}).get("id", ""))
 
-def check_daily_schedule():
-
-    now = datetime.now(BAGHDAD)
-
-    today = now.strftime("%Y-%m-%d")
-
-    # Saturday = 5, Sunday = 6
-
-    if now.weekday() in (5, 6):
+    if not text:
         return
 
-    if (
-        now.hour >= REPORT_HOUR
-        and state.get("last_report_date") != today
-    ):
+    # Only respond to the configured chat.
+    if TELEGRAM_CHAT_ID and chat_id != TELEGRAM_CHAT_ID:
+        return
 
-        logging.info("Scheduled 08:00 report started.")
+    command = text.split()[0].split("@")[0].lower()
 
-        if run_report():
+    if command in ("/start", "/help"):
+        send_message(
+            "🦅 XAUUSD MARKET REPORT BOT\n\n"
+            "/report - Get market positioning report\n"
+            "/status - Check bot status\n\n"
+            "Daily report: 08:00 Baghdad\n"
+            "Signals: DISABLED\n"
+            "Orders: DISABLED"
+        )
 
-            state["last_report_date"] = today
-            save_state()
+    elif command == "/report":
+        run_report()
+
+    elif command == "/status":
+        send_message(
+            "🦅 XAUUSD BOT STATUS\n\n"
+            "Mode: MARKET REPORT ONLY\n"
+            "Myfxbook: Configured"
+            if MYFXBOOK_EMAIL and MYFXBOOK_PASSWORD
+            else "🦅 XAUUSD BOT STATUS\n\nMyfxbook: Missing credentials"
+        )
 
 
-# ==========================================
-# MAIN
-# ==========================================
+# =========================
+# MAIN LOOP
+# =========================
 
 def main():
+    global telegram_offset, last_report_date
 
-    logging.info(
-        "XAUUSD Market Positioning Bot started."
-    )
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.error("Telegram environment variables are missing")
+        return
 
-    if not BOT_TOKEN or not CHAT_ID:
-        logging.error(
-            "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID."
-        )
-
-    if not MYFXBOOK_EMAIL or not MYFXBOOK_PASSWORD:
-        logging.error(
-            "Set MYFXBOOK_EMAIL and MYFXBOOK_PASSWORD."
-        )
+    logging.info("XAUUSD MARKET REPORT BOT started")
 
     send_message(
         "🦅 XAUUSD MARKET REPORT BOT STARTED\n\n"
@@ -794,15 +547,33 @@ def main():
     )
 
     while True:
-
         try:
+            now = datetime.now(BAGHDAD)
 
-            handle_commands()
-            check_daily_schedule()
+            # Automatic weekday report at 08:00 Baghdad.
+            if (
+                now.weekday() < 5
+                and now.hour == REPORT_HOUR
+                and now.minute == REPORT_MINUTE
+                and last_report_date != now.date()
+            ):
+                last_report_date = now.date()
+                run_report()
 
-        except Exception:
+            updates = get_updates()
 
-            logging.exception("Main loop error")
+            for update in updates:
+                telegram_offset = update["update_id"] + 1
+
+                message = update.get("message")
+                if message:
+                    handle_message(message)
+
+        except Exception as error:
+            logging.error(
+                "Main loop error. Exception type: %s",
+                type(error).__name__
+            )
 
         time.sleep(POLL_SECONDS)
 
