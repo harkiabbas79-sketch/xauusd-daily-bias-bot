@@ -1,4 +1,3 @@
-
 import os
 import time
 import json
@@ -91,6 +90,7 @@ def save_state():
 # =====================================
 
 def telegram_request(method, data=None):
+
     if not TELEGRAM_TOKEN:
         return None
 
@@ -131,6 +131,7 @@ def telegram_request(method, data=None):
 
 
 def send_message(message):
+
     if not TELEGRAM_CHAT_ID:
         return False
 
@@ -150,6 +151,7 @@ def send_message(message):
 # =====================================
 
 def number(value):
+
     try:
         result = float(value)
 
@@ -173,7 +175,6 @@ def extract_candles(data):
 
     if isinstance(data, dict):
 
-        # Official BiQuote response uses "bars".
         for key in (
             "bars",
             "data",
@@ -188,7 +189,13 @@ def extract_candles(data):
                 return value
 
             if isinstance(value, dict):
-                for nested_key in ("bars", "candles", "data"):
+
+                for nested_key in (
+                    "bars",
+                    "candles",
+                    "data"
+                ):
+
                     nested = value.get(nested_key)
 
                     if isinstance(nested, list):
@@ -224,8 +231,6 @@ def sort_candles(candles):
     if not valid:
         raise RuntimeError("No valid candles found")
 
-    # BiQuote normally returns newest candles first.
-    # Sort by openTime so RSI uses oldest to newest.
     try:
 
         valid.sort(
@@ -316,7 +321,6 @@ def calculate_rsi(candles):
     avg_gain = sum(gains[:RSI_PERIOD]) / RSI_PERIOD
     avg_loss = sum(losses[:RSI_PERIOD]) / RSI_PERIOD
 
-    # Wilder RSI smoothing
     for i in range(RSI_PERIOD, len(gains)):
 
         avg_gain = (
@@ -367,19 +371,26 @@ def calculate_targets(direction, entry):
 
 
 # =====================================
-# SIGNAL
+# CREATE SIGNAL
 # =====================================
 
 def create_signal(direction, entry, rsi):
+
+    entry = round(entry, 2)
 
     targets = calculate_targets(direction, entry)
 
     state["trade"] = {
         "direction": direction,
-        "entry": round(entry, 2),
+        "entry": entry,
         "rsi": round(rsi, 2),
         "targets": targets,
         "next_target": 0,
+
+        # Track price movement against the trade.
+        "highest_price": entry,
+        "lowest_price": entry,
+
         "started": datetime.now(BAGHDAD).strftime(
             "%Y-%m-%d %H:%M:%S"
         )
@@ -427,6 +438,107 @@ def create_signal(direction, entry, rsi):
 
 
 # =====================================
+# TRACK HIGHEST / LOWEST PRICE
+# =====================================
+
+def update_price_extremes(current_price):
+
+    trade = state.get("trade")
+
+    if not trade:
+        return
+
+    direction = trade["direction"]
+
+    highest = number(
+        trade.get("highest_price", trade["entry"])
+    )
+
+    lowest = number(
+        trade.get("lowest_price", trade["entry"])
+    )
+
+    if current_price > highest:
+        trade["highest_price"] = round(current_price, 2)
+
+    if current_price < lowest:
+        trade["lowest_price"] = round(current_price, 2)
+
+    save_state()
+
+
+# =====================================
+# FINAL TRADE SUMMARY
+# =====================================
+
+def send_final_summary(trade):
+
+    direction = trade["direction"]
+    entry = number(trade["entry"])
+
+    targets = trade["targets"]
+    tp4 = number(targets[3]["price"])
+
+    highest = number(
+        trade.get("highest_price", entry)
+    )
+
+    lowest = number(
+        trade.get("lowest_price", entry)
+    )
+
+    if direction == "SELL":
+
+        adverse_price = highest
+
+        adverse_pips = max(
+            0,
+            (highest - entry) / PIP_SIZE
+        )
+
+        movement_text = (
+            f"📈 Highest Price: {highest:.2f}\n"
+            f"⚠️ Price Against SELL: "
+            f"{adverse_pips:.0f} PIPS\n"
+        )
+
+    else:
+
+        adverse_price = lowest
+
+        adverse_pips = max(
+            0,
+            (entry - lowest) / PIP_SIZE
+        )
+
+        movement_text = (
+            f"📉 Lowest Price: {lowest:.2f}\n"
+            f"⚠️ Price Against BUY: "
+            f"{adverse_pips:.0f} PIPS\n"
+        )
+
+    message = (
+        "🏆 XAUUSD FINAL TRADE SUMMARY\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        "🎉 پیرۆزە! هەموو تارگێتەکان تەواو بوون.\n"
+        "💰 کۆی تارگێتەکە: 100 PIPS\n\n"
+
+        f"📊 Direction: {direction}\n"
+        f"📍 Entry: {entry:.2f}\n"
+        f"🎯 TP4: {tp4:.2f}\n\n"
+
+        "📊 Price Movement Report\n"
+        f"{movement_text}\n"
+
+        "✅ Trade Plan Completed\n"
+        "⚠️ Signal Only — No Orders"
+    )
+
+    send_message(message)
+
+
+# =====================================
 # TARGET MONITORING
 # =====================================
 
@@ -455,6 +567,7 @@ def monitor_targets(current_price):
             break
 
         pips = target["pips"]
+        target_number = next_target + 1
 
         message = (
             "🎉 XAUUSD TARGET REACHED!\n"
@@ -462,26 +575,24 @@ def monitor_targets(current_price):
 
             f"📊 Direction: {direction}\n"
             f"📍 Entry: {trade['entry']:.2f}\n"
-            f"💵 Current Price: {current_price:.2f}\n\n"
+            f"🎯 TP{target_number}: {target_price:.2f}\n\n"
 
-            f"🏆 TP{next_target + 1} COMPLETED\n"
-            f"💰 Profit Distance: {pips} PIPS\n"
-            f"🎯 Target Price: {target_price:.2f}\n"
+            f"🏆 پیرۆزە! تارگێتی {target_number} تەواو بوو.\n"
+            f"💰 قازانجی تارگێت: {pips} PIPS\n"
         )
 
-        if next_target == 3:
+        if target_number < 4:
 
             message += (
-                "\n🏆 ALL FOUR TARGETS COMPLETED!\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                "The trade plan is finished.\n"
+                "\n⏳ چاوەڕێی تارگێتی دواترین.\n"
+                "🚫 سیگناڵی نوێ نانێردرێت."
             )
 
         else:
 
             message += (
-                "\n⏳ Waiting for the next target.\n"
-                "🚫 No new signal during this trade.\n"
+                "\n🏆 هەموو چوار تارگێتەکە تەواو بوون!\n"
+                "🎉 پیرۆزە بۆ 100 PIPS!"
             )
 
         send_message(message)
@@ -496,27 +607,31 @@ def monitor_targets(current_price):
 
         logging.info("All four targets completed")
 
+        # Fifth message: final price movement report.
+        send_final_summary(trade)
+
         state["trade"] = None
 
-        if state["pending_rearm"]:
+        if state["pending_rearm"] and state.get("bias"):
 
             state["armed"] = True
             state["pending_rearm"] = False
 
             send_message(
-                "✅ Previous trade completed.\n"
-                "New daily bias is ready.\n"
-                "Waiting for RSI 5M."
+                "✅ مامەڵەی پێشوو تەواو بوو.\n"
+                "بایەسی نوێ چالاکە.\n"
+                "⏳ چاوەڕێی RSI 5M."
             )
 
         else:
 
             state["armed"] = False
+            state["pending_rearm"] = False
 
             send_message(
-                "⏳ Waiting for your next daily bias:\n\n"
+                "⏳ چاوەڕێی بایەسی ڕۆژانەی نوێ:\n\n"
                 "Bias Buy\n"
-                "or\n"
+                "یان\n"
                 "Bias Sell"
             )
 
@@ -548,6 +663,7 @@ def monitor_market():
     # First monitor an active trade.
     if state.get("trade"):
 
+        update_price_extremes(current_price)
         monitor_targets(current_price)
         return
 
@@ -564,7 +680,6 @@ def monitor_market():
         len(candles)
     )
 
-    # BUY condition.
     if direction == "BUY" and rsi <= BUY_RSI:
 
         create_signal(
@@ -573,7 +688,6 @@ def monitor_market():
             rsi
         )
 
-    # SELL condition.
     elif direction == "SELL" and rsi >= SELL_RSI:
 
         create_signal(
@@ -639,6 +753,57 @@ def set_bias(direction):
 
 
 # =====================================
+# CANCEL BIAS AND ACTIVE TRADE
+# =====================================
+
+def cancel_everything():
+
+    had_bias = bool(state.get("bias"))
+    had_trade = bool(state.get("trade"))
+
+    # Cancel everything, including active trade tracking.
+    state["bias"] = None
+    state["armed"] = False
+    state["pending_rearm"] = False
+    state["trade"] = None
+
+    save_state()
+
+    if had_trade:
+
+        send_message(
+            "🛑 TRADE CANCELLED\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+
+            "مامەڵەی چالاک هەڵوەشێندرایەوە.\n"
+            "❌ چاودێری TP1 تا TP4 وەستا.\n"
+            "❌ ئاگادارکردنەوەی تارگێتەکان ناگات.\n\n"
+
+            "📊 Daily Bias: CANCELLED\n"
+            "⏳ چاوەڕێی بایەسی نوێ."
+        )
+
+    elif had_bias:
+
+        send_message(
+            "🛑 DAILY BIAS CANCELLED\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+
+            "بایەس هەڵوەشێندرایەوە.\n"
+            "⏳ چاوەڕێی بایەسی نوێ."
+        )
+
+    else:
+
+        send_message(
+            "ℹ️ هیچ بایەس یان مامەڵەیەکی چالاک نییە.\n\n"
+            "⏳ چاوەڕێی بایەسی نوێ."
+        )
+
+    logging.info("Bias and active trade cancelled")
+
+
+# =====================================
 # STATUS
 # =====================================
 
@@ -672,7 +837,9 @@ def send_status():
         "SELL: RSI >= 70\n\n"
 
         "Stop Loss: NONE\n"
-        "Orders: DISABLED"
+        "Orders: DISABLED\n\n"
+
+        "/cancel - Cancel everything"
     )
 
 
@@ -724,6 +891,10 @@ def handle_message(message):
 
         set_bias("SELL")
 
+    elif normalized == "/CANCEL":
+
+        cancel_everything()
+
     elif normalized == "/STATUS":
 
         send_status()
@@ -746,7 +917,9 @@ def handle_message(message):
             "Targets:\n"
             "40 / 60 / 80 / 100 PIPS\n\n"
 
-            "/status - Bot Status\n\n"
+            "Commands:\n"
+            "/status - Bot Status\n"
+            "/cancel - Cancel everything\n\n"
 
             "Signals Only.\n"
             "No Stop Loss.\n"
@@ -757,9 +930,11 @@ def handle_message(message):
 
         send_message(
             "⚠️ نامەکە نەناسراوە.\n\n"
-            "تەنها یەکێک لەم دووانە بنێرە:\n\n"
+            "ئەم فەرمانانە بەکاربهێنە:\n\n"
             "Bias Buy\n"
-            "Bias Sell"
+            "Bias Sell\n"
+            "/status\n"
+            "/cancel"
         )
 
 
@@ -807,6 +982,9 @@ def main():
         "Bias Buy\n"
         "or\n"
         "Bias Sell\n\n"
+
+        "/cancel - Cancel everything\n"
+        "/status - Bot Status\n\n"
 
         "🚫 No automatic orders."
     )
