@@ -1,4 +1,3 @@
-
 import os
 import time
 import logging
@@ -112,7 +111,6 @@ def send_message(message):
 
 def initialize_telegram():
 
-    # Remove an existing webhook before using getUpdates.
     result = telegram_request(
         "deleteWebhook",
         {
@@ -139,6 +137,9 @@ def myfxbook_request(endpoint, params):
             timeout=25
         )
 
+    except requests.Timeout:
+        raise RuntimeError("Myfxbook connection timed out")
+
     except requests.RequestException:
         raise RuntimeError("Myfxbook connection failed")
 
@@ -147,25 +148,30 @@ def myfxbook_request(endpoint, params):
 
     if response.status_code != 200:
         raise RuntimeError(
-            f"Myfxbook HTTP error: {response.status_code}"
+            f"Myfxbook HTTP {response.status_code}"
         )
 
     try:
         data = response.json()
+
     except ValueError:
         raise RuntimeError("Invalid Myfxbook response")
 
     if data.get("error"):
-        message = str(data.get("message", ""))
 
-        if message in (
-            "Invalid credentials",
-            "Invalid session",
-            "Invalid symbol"
-        ):
-            raise RuntimeError(message)
+        message = str(
+            data.get("message", "Unknown error")
+        )
 
-        raise RuntimeError("Myfxbook API request failed")
+        logging.error(
+            "Myfxbook rejected %s: %s",
+            endpoint,
+            message[:200]
+        )
+
+        raise RuntimeError(
+            f"Myfxbook {endpoint}: {message[:200]}"
+        )
 
     return data
 
@@ -173,7 +179,9 @@ def myfxbook_request(endpoint, params):
 def get_myfxbook_outlook():
 
     if not MYFXBOOK_EMAIL or not MYFXBOOK_PASSWORD:
-        raise RuntimeError("Myfxbook credentials missing")
+        raise RuntimeError(
+            "Myfxbook credentials missing"
+        )
 
     login_data = myfxbook_request(
         "login.json",
@@ -203,12 +211,24 @@ def get_myfxbook_outlook():
 
             name = str(
                 item.get("name", "")
-            ).upper()
+            ).upper().replace("/", "").replace(".", "")
 
             if name in ("XAUUSD", "GOLD"):
                 return item
 
-        raise RuntimeError("XAUUSD not found in Myfxbook")
+        available = [
+            str(item.get("name", ""))
+            for item in symbols
+        ]
+
+        logging.warning(
+            "XAUUSD not found. Available symbols: %s",
+            available[:30]
+        )
+
+        raise RuntimeError(
+            "XAUUSD not found in Myfxbook data"
+        )
 
     finally:
 
@@ -393,7 +413,9 @@ def get_hourly_candles():
         raise RuntimeError("BiQuote connection failed")
 
     if response.status_code != 200:
-        raise RuntimeError("BiQuote HTTP error")
+        raise RuntimeError(
+            f"BiQuote HTTP error: {response.status_code}"
+        )
 
     try:
         data = response.json()
@@ -528,7 +550,7 @@ def generate_report():
 
         logging.warning(
             "Liquidity calculation failed: %s",
-            type(error).__name__
+            str(error)
         )
 
         liquidity = (
@@ -586,9 +608,8 @@ def run_report():
 
     except Exception as error:
 
-        logging.error(
-            "Report failed: %s",
-            type(error).__name__
+        logging.exception(
+            "Report failed"
         )
 
         send_message(
@@ -632,7 +653,7 @@ def handle_message(message):
     if not text:
         return
 
-    # Security: only the configured chat can use the bot.
+    # Only the configured chat can use this bot.
     if TELEGRAM_CHAT_ID and chat_id != TELEGRAM_CHAT_ID:
         return
 
@@ -685,7 +706,6 @@ def handle_message(message):
 
     else:
 
-        # Any ordinary text requests a fresh report.
         logging.info("Ordinary message received")
 
         run_report()
@@ -759,12 +779,9 @@ def main():
                 if message:
                     handle_message(message)
 
-        except Exception as error:
+        except Exception:
 
-            logging.error(
-                "Main loop error: %s",
-                type(error).__name__
-            )
+            logging.exception("Main loop error")
 
         time.sleep(POLL_SECONDS)
 
